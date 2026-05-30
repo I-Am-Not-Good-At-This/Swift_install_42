@@ -189,33 +189,43 @@ def patch_shell_rc():
 
 
 def verify_signature(tarball: Path, sig: Path) -> bool:
-    """Verify PGP signature. Returns True if verified, False on failure."""
+    """Verify PGP signature using an isolated GNUPGHOME to avoid shared keyboxd
+    lock contention on multi-user machines (common on 42 clusters)."""
     if not shutil.which("gpg"):
         warn("gpg not found — skipping signature verification")
         return True
 
-    log("Importing Swift PGP keys from swift.org...")
-    for fingerprint, asc_url in PGP_KEYS:
-        # Import directly from swift.org — more reliable than keyserver
-        result = run(
-            f"wget -q -O - {asc_url} | gpg --import -",
-            check=False, capture=True
-        )
-        if result.returncode != 0:
-            # Fall back to keyserver
-            run(
-                f"gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys {fingerprint}",
-                check=False
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp_gpg:
+        # Isolated env: bypasses the shared keyboxd daemon entirely,
+        # uses a plain file keyring only this process can touch.
+        env = os.environ.copy()
+        env["GNUPGHOME"] = tmp_gpg
+
+        def gpg(cmd):
+            return subprocess.run(
+                cmd, shell=True, check=False,
+                capture_output=True, text=True, env=env
             )
 
-    result = run(f'gpg --verify "{sig}" "{tarball}"', check=False, capture=True)
-    if result.returncode == 0:
-        ok("PGP signature verified")
-        return True
-    else:
-        error("PGP signature verification FAILED — aborting for safety")
-        error(result.stderr.strip())
-        return False
+        log("Importing Swift PGP keys (isolated keyring)...")
+        for fingerprint, asc_url in PGP_KEYS:
+            r = subprocess.run(
+                f"wget -q -O - {asc_url} | gpg --homedir {tmp_gpg} --import -",
+                shell=True, check=False, capture_output=True, text=True
+            )
+            if r.returncode != 0:
+                warn(f"wget import failed for {fingerprint[:16]}, trying keyserver...")
+                gpg(f"gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys {fingerprint}")
+
+        result = gpg(f'gpg --verify "{sig}" "{tarball}"')
+        if result.returncode == 0:
+            ok("PGP signature verified")
+            return True
+        else:
+            error("PGP signature verification FAILED — aborting for safety")
+            error(result.stderr.strip())
+            return False
 
 
 # ─────────────────────────────────────────────
@@ -246,8 +256,7 @@ def do_clean():
         shutil.rmtree(DOWNLOAD_DIR)
         ok(f"Removed temp dir {DOWNLOAD_DIR}")
 
-    rc = detect_shell_rc()
-    if rc:
+    for rc in detect_shell_rcs():
         content = rc.read_text()
         if "# swift-goinfre" in content:
             lines = [l for l in content.splitlines()
